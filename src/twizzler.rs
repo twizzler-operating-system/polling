@@ -6,9 +6,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use twizzler_abi::syscall::{ThreadSync, ThreadSyncSleep};
+use twizzler_abi::syscall::ThreadSync;
+use twizzler_futures::TwizzlerWaitable;
 
-use crate::{Event, PollMode, TwizzlerWaitPoint};
+use crate::{BorrowedTwizzlerWaitable, Event, PollMode};
 
 /// Interface to poll.
 #[derive(Debug)]
@@ -43,7 +44,56 @@ struct Wps {
     polls: Vec<ThreadSync>,
     /// The map of each file descriptor to data associated with it. This does not include the file
     /// descriptors `notify_read` or `notify_write`.
-    wp_data: HashMap<ThreadSyncSleep, WpData>,
+    wp_data: HashMap<HashKey, WpData>,
+    polls_keys: Vec<HashKey>,
+
+    cleanup_buffer: Vec<HashKey>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Ord, Eq, Hash)]
+#[repr(transparent)]
+struct HashKey(usize);
+
+impl HashKey {
+    fn new(key: usize, write: bool) -> Self {
+        Self(key * 2 | if write { 1 } else { 0 })
+    }
+}
+
+impl Wps {
+    fn push_item(&mut self, source: &BorrowedTwizzlerWaitable<'static>, mut data: WpData) {
+        let index = self.polls.len();
+        data.poll_wps_index = index;
+        data.bw_key = source.key();
+        let sleep = if data.write {
+            source.waitable.wait_item_write()
+        } else {
+            source.waitable.wait_item_read()
+        };
+        self.polls.push(ThreadSync::new_sleep(sleep));
+        self.polls_keys.push(data.hash_key());
+        self.wp_data.insert(data.hash_key(), data);
+        if self.cleanup_buffer.capacity() < self.polls.len() {
+            self.cleanup_buffer
+                .reserve(self.polls.len() - self.cleanup_buffer.capacity());
+        }
+    }
+
+    fn remove_item_dir(&mut self, source: &BorrowedTwizzlerWaitable<'static>, write: bool) {
+        self.remove_item_key(&HashKey::new(source.key(), write));
+    }
+
+    fn remove_item_key(&mut self, key: &HashKey) {
+        if let Some(data) = self.wp_data.remove(key) {
+            self.polls.swap_remove(data.poll_wps_index);
+            self.polls_keys.swap_remove(data.poll_wps_index);
+
+            if let Some(swapped_data) = self.wp_data.get_mut(&self.polls_keys[data.poll_wps_index])
+            {
+                swapped_data.poll_wps_index = data.poll_wps_index;
+            }
+        }
+    }
 }
 
 /// Data associated with a file descriptor in a poller.
@@ -55,8 +105,14 @@ struct WpData {
     key: usize,
     /// Whether to remove this waitpoint from the poller on the next call to `wait`.
     remove: bool,
-    /// If this is write or read
     write: bool,
+    bw_key: usize,
+}
+
+impl WpData {
+    fn hash_key(&self) -> HashKey {
+        HashKey::new(self.bw_key, self.write)
+    }
 }
 
 bitflags::bitflags! {
@@ -77,8 +133,10 @@ impl Poller {
 
         Ok(Self {
             wps: Mutex::new(Wps {
-                polls: vec![ThreadSync::new_sleep(notify.fd().read)],
+                polls: vec![ThreadSync::new_sleep(notify.fd().wait_item_read())],
                 wp_data: HashMap::new(),
+                polls_keys: vec![HashKey::new(0, false)],
+                cleanup_buffer: vec![],
             }),
             notify,
             waiting_operations: AtomicUsize::new(0),
@@ -98,7 +156,12 @@ impl Poller {
     }
 
     /// Adds a new file descriptor.
-    pub fn add(&self, wp: TwizzlerWaitPoint, ev: Event, mode: PollMode) -> io::Result<()> {
+    pub fn add(
+        &self,
+        wp: &BorrowedTwizzlerWaitable<'static>,
+        ev: Event,
+        mode: PollMode,
+    ) -> io::Result<()> {
         let span = tracing::trace_span!(
             "add",
             notify_read = ?self.notify.fd(),
@@ -111,36 +174,36 @@ impl Poller {
         }
 
         self.modify_wps(|wps| {
-            if ev.writable && wps.wp_data.contains_key(&wp.write)
-                || ev.readable && wps.wp_data.contains_key(&wp.read)
+            if ev.writable && wps.wp_data.contains_key(&HashKey::new(wp.key(), true))
+                || ev.readable && wps.wp_data.contains_key(&HashKey::new(wp.key(), false))
             {
                 return Err(io::Error::from(io::ErrorKind::AlreadyExists));
             }
             if ev.readable {
-                let index = wps.polls.len();
-                wps.wp_data.insert(
-                    wp.read,
+                wps.push_item(
+                    &wp,
                     WpData {
-                        poll_wps_index: index,
                         key: ev.key,
                         remove: cvt_mode_as_remove(mode)?,
                         write: false,
+                        // These get set in push.
+                        poll_wps_index: 0,
+                        bw_key: 0,
                     },
                 );
-                wps.polls.push(ThreadSync::new_sleep(wp.read));
             }
             if ev.writable {
-                let index = wps.polls.len();
-                wps.wp_data.insert(
-                    wp.write,
+                wps.push_item(
+                    &wp,
                     WpData {
-                        poll_wps_index: index,
                         key: ev.key,
                         remove: cvt_mode_as_remove(mode)?,
                         write: true,
+                        // These get set in push.
+                        poll_wps_index: 0,
+                        bw_key: 0,
                     },
                 );
-                wps.polls.push(ThreadSync::new_sleep(wp.write));
             }
 
             Ok(())
@@ -148,76 +211,65 @@ impl Poller {
     }
 
     /// Modifies an existing file descriptor.
-    pub fn modify(&self, wp: TwizzlerWaitPoint, ev: Event, mode: PollMode) -> io::Result<()> {
+    pub fn modify(
+        &self,
+        source: &BorrowedTwizzlerWaitable<'static>,
+        ev: Event,
+        mode: PollMode,
+    ) -> io::Result<()> {
         let span = tracing::trace_span!(
             "modify",
             notify_read = ?self.notify.fd(),
-            ?wp,
+            ?source,
             ?ev,
         );
         let _enter = span.enter();
 
         self.modify_wps(|wps| {
             if ev.readable {
-                if let Some(data) = wps.wp_data.get_mut(&wp.read) {
+                if let Some(data) = wps.wp_data.get_mut(&HashKey::new(source.key(), false)) {
                     data.key = ev.key;
                     data.remove = cvt_mode_as_remove(mode)?;
+                    wps.polls[data.poll_wps_index] =
+                        ThreadSync::new_sleep(source.waitable.wait_item_read());
                 } else {
-                    let index = wps.polls.len();
-                    wps.wp_data.insert(
-                        wp.read,
+                    wps.push_item(
+                        source,
                         WpData {
-                            poll_wps_index: index,
                             key: ev.key,
                             remove: cvt_mode_as_remove(mode)?,
                             write: false,
+                            // These get set in push.
+                            poll_wps_index: 0,
+                            bw_key: 0,
                         },
                     );
-                    wps.polls.push(ThreadSync::new_sleep(wp.read));
                 }
             } else {
-                if let Some(data) = wps.wp_data.remove(&wp.read) {
-                    wps.polls.swap_remove(data.poll_wps_index);
-                    if let Some(swapped_pollwp) = wps.polls.get(data.poll_wps_index) {
-                        let sleep = match swapped_pollwp {
-                            ThreadSync::Sleep(s, _) => s,
-                            // We never push a wake command onto this vec.
-                            ThreadSync::Wake(_, _) => unreachable!(),
-                        };
-                        wps.wp_data.get_mut(&sleep).unwrap().poll_wps_index = data.poll_wps_index;
-                    }
-                }
+                wps.remove_item_dir(source, false);
             }
 
             if ev.writable {
-                if let Some(data) = wps.wp_data.get_mut(&wp.write) {
+                if let Some(data) = wps.wp_data.get_mut(&HashKey::new(source.key(), true)) {
                     data.key = ev.key;
                     data.remove = cvt_mode_as_remove(mode)?;
+                    wps.polls[data.poll_wps_index] =
+                        ThreadSync::new_sleep(source.waitable.wait_item_write());
                 } else {
-                    let index = wps.polls.len();
-                    wps.wp_data.insert(
-                        wp.write,
+                    wps.push_item(
+                        source,
                         WpData {
-                            poll_wps_index: index,
                             key: ev.key,
                             remove: cvt_mode_as_remove(mode)?,
                             write: true,
+                            // These get set in push.
+                            poll_wps_index: 0,
+                            bw_key: 0,
                         },
                     );
-                    wps.polls.push(ThreadSync::new_sleep(wp.write));
                 }
             } else {
-                if let Some(data) = wps.wp_data.remove(&wp.write) {
-                    wps.polls.swap_remove(data.poll_wps_index);
-                    if let Some(swapped_pollwp) = wps.polls.get(data.poll_wps_index) {
-                        let sleep = match swapped_pollwp {
-                            ThreadSync::Sleep(s, _) => s,
-                            // We never push a wake command onto this vec.
-                            ThreadSync::Wake(_, _) => unreachable!(),
-                        };
-                        wps.wp_data.get_mut(&sleep).unwrap().poll_wps_index = data.poll_wps_index;
-                    }
-                }
+                wps.remove_item_dir(source, true);
             }
 
             Ok(())
@@ -225,39 +277,17 @@ impl Poller {
     }
 
     /// Deletes a file descriptor.
-    pub fn delete(&self, wp: TwizzlerWaitPoint) -> io::Result<()> {
+    pub fn delete(&self, source: &BorrowedTwizzlerWaitable<'static>) -> io::Result<()> {
         let span = tracing::trace_span!(
             "delete",
             notify_read = ?self.notify.fd(),
-            ?wp,
+            ?source,
         );
         let _enter = span.enter();
 
         self.modify_wps(|wps| {
-            if let Some(data) = wps.wp_data.remove(&wp.read) {
-                wps.polls.swap_remove(data.poll_wps_index);
-                if let Some(swapped_pollwp) = wps.polls.get(data.poll_wps_index) {
-                    let sleep = match swapped_pollwp {
-                        ThreadSync::Sleep(s, _) => s,
-                        // We never push a wake command onto this vec.
-                        ThreadSync::Wake(_, _) => unreachable!(),
-                    };
-                    wps.wp_data.get_mut(&sleep).unwrap().poll_wps_index = data.poll_wps_index;
-                }
-            }
-
-            if let Some(data) = wps.wp_data.remove(&wp.write) {
-                wps.polls.swap_remove(data.poll_wps_index);
-                if let Some(swapped_pollwp) = wps.polls.get(data.poll_wps_index) {
-                    let sleep = match swapped_pollwp {
-                        ThreadSync::Sleep(s, _) => s,
-                        // We never push a wake command onto this vec.
-                        ThreadSync::Wake(_, _) => unreachable!(),
-                    };
-                    wps.wp_data.get_mut(&sleep).unwrap().poll_wps_index = data.poll_wps_index;
-                }
-            }
-
+            wps.remove_item_dir(source, false);
+            wps.remove_item_dir(source, true);
             Ok(())
         })
     }
@@ -306,7 +336,7 @@ impl Poller {
 
             let wps = &mut *wps;
             // Store the events if there were any.
-            for wp_data in wps.wp_data.values_mut() {
+            for wp_data in wps.wp_data.values() {
                 let poll_wp = &mut wps.polls[wp_data.poll_wps_index];
                 if poll_wp.ready() {
                     // Store event
@@ -324,7 +354,20 @@ impl Poller {
                     });
                     // Remove interest if necessary
                     if wp_data.remove {
-                        // TODO
+                        wps.cleanup_buffer.push(wp_data.hash_key());
+                    }
+                }
+            }
+
+            for hk in &wps.cleanup_buffer {
+                if let Some(data) = wps.wp_data.remove(hk) {
+                    wps.polls.swap_remove(data.poll_wps_index);
+                    wps.polls_keys.swap_remove(data.poll_wps_index);
+
+                    if let Some(swapped_data) =
+                        wps.wp_data.get_mut(&wps.polls_keys[data.poll_wps_index])
+                    {
+                        swapped_data.poll_wps_index = data.poll_wps_index;
                     }
                 }
             }
@@ -339,7 +382,7 @@ impl Poller {
     pub fn notify(&self) -> io::Result<()> {
         let span = tracing::trace_span!(
             "notify",
-            notify_read = ?self.notify.fd().read,
+            notify_read = ?self.notify.fd().wait_item_read(),
         );
         let _enter = span.enter();
 
@@ -474,7 +517,7 @@ mod notify {
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
 
-    use crate::TwizzlerWaitPoint;
+    use crate::BorrowedTwizzlerWaitable;
 
     /// A notification pipe.
     ///
@@ -513,10 +556,10 @@ mod notify {
         }
 
         /// Provides the eventfd file handle that needs to be registered by the `Poller`.
-        pub(super) fn fd(&self) -> TwizzlerWaitPoint {
-            TwizzlerWaitPoint {
-                read: self.wait_item_read(),
-                write: self.wait_item_write(),
+        pub(super) fn fd(&self) -> BorrowedTwizzlerWaitable<'_> {
+            BorrowedTwizzlerWaitable {
+                waitable: self,
+                key: 0,
             }
         }
 

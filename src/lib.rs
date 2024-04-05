@@ -120,15 +120,39 @@ cfg_if! {
     }
 }
 
-#[derive(Clone, Copy, Hash, Debug, PartialEq, PartialOrd, Ord, Eq)]
-pub struct TwizzlerWaitPoint {
-    read: twizzler_abi::syscall::ThreadSyncSleep,
-    write: twizzler_abi::syscall::ThreadSyncSleep,
+pub struct BorrowedTwizzlerWaitable<'a> {
+    pub(crate) waitable: &'a (dyn TwizzlerWaitable + Sync),
+    key: usize,
+}
+
+impl BorrowedTwizzlerWaitable<'static> {
+    pub fn key(&self) -> usize {
+        self.key
+    }
+}
+
+impl<'a> core::fmt::Debug for BorrowedTwizzlerWaitable<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BorrowedTwizzlerWaitable")
+            .field("key", &self.key)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> TwizzlerWaitable for BorrowedTwizzlerWaitable<'a> {
+    fn wait_item_read(&self) -> twizzler_abi::syscall::ThreadSyncSleep {
+        self.waitable.wait_item_read()
+    }
+
+    fn wait_item_write(&self) -> twizzler_abi::syscall::ThreadSyncSleep {
+        self.waitable.wait_item_write()
+    }
 }
 
 pub mod os;
 mod twizzler;
 use twizzler as sys;
+use twizzler_futures::TwizzlerWaitable;
 
 /// Key associated with notifications.
 const NOTIFY_KEY: usize = usize::MAX;
@@ -1079,25 +1103,13 @@ cfg_if! {
         /// A resource with a raw file descriptor.
         pub trait AsRawSource {
             /// Returns the raw file descriptor.
-            fn raw(&self) -> TwizzlerWaitPoint;
-        }
-
-        impl AsRawSource for TwizzlerWaitPoint {
-            fn raw(&self) -> TwizzlerWaitPoint {
-                *self
-            }
+            fn raw(&self) -> &BorrowedTwizzlerWaitable<'static>;
         }
 
         /// A resource with a borrowed file descriptor.
         pub trait AsSource {
             /// Returns the borrowed file descriptor.
-            fn source(&self) -> TwizzlerWaitPoint;
-        }
-
-        impl AsSource for TwizzlerWaitPoint {
-            fn source(&self) -> TwizzlerWaitPoint {
-                *self
-            }
+            fn source(&self) -> &BorrowedTwizzlerWaitable<'static>;
         }
     } else if #[cfg(windows)] {
         use std::os::windows::io::{AsRawSocket, RawSocket, AsSocket, BorrowedSocket};
