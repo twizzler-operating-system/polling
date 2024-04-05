@@ -114,12 +114,21 @@ cfg_if! {
     } else if #[cfg(target_os = "windows")] {
         mod iocp;
         use iocp as sys;
+    } else if #[cfg(target_os = "twizzler")] {
     } else {
         compile_error!("polling does not support this target OS");
     }
 }
 
+#[derive(Clone, Copy, Hash, Debug, PartialEq, PartialOrd, Ord, Eq)]
+pub struct TwizzlerWaitPoint {
+    read: twizzler_abi::syscall::ThreadSyncSleep,
+    write: twizzler_abi::syscall::ThreadSyncSleep,
+}
+
 pub mod os;
+mod twizzler;
+use twizzler as sys;
 
 /// Key associated with notifications.
 const NOTIFY_KEY: usize = usize::MAX;
@@ -1065,6 +1074,31 @@ cfg_if! {
         }
 
         impl<T: AsFd> AsSource for T {}
+
+    } else if #[cfg(target_os = "twizzler")] {
+        /// A resource with a raw file descriptor.
+        pub trait AsRawSource {
+            /// Returns the raw file descriptor.
+            fn raw(&self) -> TwizzlerWaitPoint;
+        }
+
+        impl AsRawSource for TwizzlerWaitPoint {
+            fn raw(&self) -> TwizzlerWaitPoint {
+                *self
+            }
+        }
+
+        /// A resource with a borrowed file descriptor.
+        pub trait AsSource {
+            /// Returns the borrowed file descriptor.
+            fn source(&self) -> TwizzlerWaitPoint;
+        }
+
+        impl AsSource for TwizzlerWaitPoint {
+            fn source(&self) -> TwizzlerWaitPoint {
+                *self
+            }
+        }
     } else if #[cfg(windows)] {
         use std::os::windows::io::{AsRawSocket, RawSocket, AsSocket, BorrowedSocket};
 
