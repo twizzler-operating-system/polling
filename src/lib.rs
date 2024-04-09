@@ -125,9 +125,55 @@ pub struct BorrowedTwizzlerWaitable<'a> {
     key: usize,
 }
 
-impl BorrowedTwizzlerWaitable<'static> {
+struct UniqueIds {
+    counter: usize,
+    reuse: Vec<usize>,
+}
+
+impl UniqueIds {
+    fn next(&mut self) -> usize {
+        match self.reuse.pop() {
+            Some(v) => v,
+            None => {
+                self.counter += 1;
+                self.counter
+            }
+        }
+    }
+
+    fn release(&mut self, v: usize) {
+        if v == 0 {
+            return;
+        }
+        if self.counter == v {
+            self.counter -= 1;
+        } else {
+            self.reuse.push(v);
+        }
+    }
+}
+
+static UNIQUE_IDS: Mutex<UniqueIds> = std::sync::Mutex::new(UniqueIds {
+    counter: 1,
+    reuse: Vec::new(),
+});
+
+impl<'a> BorrowedTwizzlerWaitable<'a> {
+    pub fn new(waitable: &'a (dyn TwizzlerWaitable + Sync)) -> Self {
+        Self {
+            waitable,
+            key: UNIQUE_IDS.lock().unwrap().next(),
+        }
+    }
+
     pub fn key(&self) -> usize {
         self.key
+    }
+}
+
+impl<'a> Drop for BorrowedTwizzlerWaitable<'a> {
+    fn drop(&mut self) {
+        UNIQUE_IDS.lock().unwrap().release(self.key());
     }
 }
 

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::{self};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -20,7 +21,7 @@ pub struct Poller {
     ///
     /// On all platforms except ESP IDF, the `pipe` syscall is used.
     /// On ESP IDF, the `eventfd` syscall is used instead.
-    notify: notify::Notify,
+    notify: Pin<Box<notify::Notify>>,
     /// The number of operations (`add`, `modify` or `delete`) that are currently waiting on the
     /// mutex to become free. When this is nonzero, `wait` must be suspended until it reaches zero
     /// again.
@@ -85,11 +86,12 @@ impl Wps {
 
     fn remove_item_key(&mut self, key: &HashKey) {
         if let Some(data) = self.wp_data.remove(key) {
+            // Unwrap-Ok: this vec is never empty.
+            let swapped_key = *self.polls_keys.last().unwrap();
             self.polls.swap_remove(data.poll_wps_index);
             self.polls_keys.swap_remove(data.poll_wps_index);
 
-            if let Some(swapped_data) = self.wp_data.get_mut(&self.polls_keys[data.poll_wps_index])
-            {
+            if let Some(swapped_data) = self.wp_data.get_mut(&swapped_key) {
                 swapped_data.poll_wps_index = data.poll_wps_index;
             }
         }
@@ -127,13 +129,14 @@ struct PollFlags: u32 {
 impl Poller {
     /// Creates a new poller.
     pub fn new() -> io::Result<Poller> {
-        let notify = notify::Notify::new()?;
+        let notify = Box::pin(notify::Notify::new()?);
 
         tracing::trace!(?notify, "new");
 
+        let sleep = ThreadSync::new_sleep(notify.wait_item_read());
         Ok(Self {
             wps: Mutex::new(Wps {
-                polls: vec![ThreadSync::new_sleep(notify.fd().wait_item_read())],
+                polls: vec![sleep],
                 wp_data: HashMap::new(),
                 polls_keys: vec![HashKey::new(0, false)],
                 cleanup_buffer: vec![],
@@ -164,7 +167,7 @@ impl Poller {
     ) -> io::Result<()> {
         let span = tracing::trace_span!(
             "add",
-            notify_read = ?self.notify.fd(),
+            notify_read = ?self.notify,
             ?wp,
             ?ev,
         );
@@ -219,13 +222,14 @@ impl Poller {
     ) -> io::Result<()> {
         let span = tracing::trace_span!(
             "modify",
-            notify_read = ?self.notify.fd(),
+            notify_read = ?self.notify,
             ?source,
             ?ev,
         );
         let _enter = span.enter();
 
         self.modify_wps(|wps| {
+            //tracing::trace!("wps: {:?}", wps);
             if ev.readable {
                 if let Some(data) = wps.wp_data.get_mut(&HashKey::new(source.key(), false)) {
                     data.key = ev.key;
@@ -280,7 +284,7 @@ impl Poller {
     pub fn delete(&self, source: &BorrowedTwizzlerWaitable<'static>) -> io::Result<()> {
         let span = tracing::trace_span!(
             "delete",
-            notify_read = ?self.notify.fd(),
+            notify_read = ?self.notify,
             ?source,
         );
         let _enter = span.enter();
@@ -296,7 +300,7 @@ impl Poller {
     pub fn wait(&self, events: &mut Events, timeout: Option<Duration>) -> io::Result<()> {
         let span = tracing::trace_span!(
             "wait",
-            notify_read = ?self.notify.fd(),
+            notify_read = ?self.notify,
             ?timeout,
         );
         let _enter = span.enter();
@@ -321,6 +325,7 @@ impl Poller {
                 wps = self.operations_complete.wait(wps).unwrap();
             }
 
+            //tracing::trace!("wait wps: {:?}", wps);
             // Perform the poll.
             let timeout =
                 deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
@@ -359,14 +364,14 @@ impl Poller {
                 }
             }
 
-            for hk in &wps.cleanup_buffer {
-                if let Some(data) = wps.wp_data.remove(hk) {
+            for hk in wps.cleanup_buffer.drain(..) {
+                if let Some(data) = wps.wp_data.remove(&hk) {
+                    // Unwrap-Ok: this vec is never empty.
+                    let swapped_key = *wps.polls_keys.last().unwrap();
                     wps.polls.swap_remove(data.poll_wps_index);
                     wps.polls_keys.swap_remove(data.poll_wps_index);
 
-                    if let Some(swapped_data) =
-                        wps.wp_data.get_mut(&wps.polls_keys[data.poll_wps_index])
-                    {
+                    if let Some(swapped_data) = wps.wp_data.get_mut(&swapped_key) {
                         swapped_data.poll_wps_index = data.poll_wps_index;
                     }
                 }
@@ -382,7 +387,7 @@ impl Poller {
     pub fn notify(&self) -> io::Result<()> {
         let span = tracing::trace_span!(
             "notify",
-            notify_read = ?self.notify.fd().wait_item_read(),
+            notify_read = ?self.notify,
         );
         let _enter = span.enter();
 
@@ -514,17 +519,17 @@ mod notify {
     use twizzler_futures::TwizzlerWaitable;
 
     use std::io;
+    use std::marker::PhantomPinned;
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
-
-    use crate::BorrowedTwizzlerWaitable;
 
     /// A notification pipe.
     ///
     /// This implementation uses ther `eventfd` syscall to send notifications.
     #[derive(Debug)]
     pub(super) struct Notify {
-        event: AtomicU64,
+        pub(super) event: AtomicU64,
+        _pin: PhantomPinned,
     }
 
     impl TwizzlerWaitable for Notify {
@@ -552,20 +557,14 @@ mod notify {
         pub(super) fn new() -> io::Result<Self> {
             Ok(Self {
                 event: AtomicU64::new(0),
+                _pin: PhantomPinned,
             })
-        }
-
-        /// Provides the eventfd file handle that needs to be registered by the `Poller`.
-        pub(super) fn fd(&self) -> BorrowedTwizzlerWaitable<'_> {
-            BorrowedTwizzlerWaitable {
-                waitable: self,
-                key: 0,
-            }
         }
 
         /// Notifies the `Poller` instance via the eventfd file descriptor.
         pub(super) fn notify(&self) -> Result<(), io::Error> {
             if self.event.load(Ordering::SeqCst) == u64::MAX {
+                tracing::warn!("notify event count overflow");
                 return Err(io::Error::from(io::ErrorKind::WouldBlock));
             }
             self.event.fetch_add(1, Ordering::SeqCst);
