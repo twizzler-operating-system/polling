@@ -10,17 +10,14 @@ use std::time::{Duration, Instant};
 use twizzler_abi::syscall::ThreadSync;
 use twizzler_futures::TwizzlerWaitable;
 
-use crate::{BorrowedTwizzlerWaitable, Event, PollMode};
+use crate::{Event, PollMode};
 
-/// Interface to poll.
+/// Interface to twizzler's thread sync.
 #[derive(Debug)]
 pub struct Poller {
-    /// File descriptors to poll.
+    /// Pollable objects.
     wps: Mutex<Wps>,
-    /// Notification pipe for waking up the poller.
-    ///
-    /// On all platforms except ESP IDF, the `pipe` syscall is used.
-    /// On ESP IDF, the `eventfd` syscall is used instead.
+    /// Notification for waking up the poller.
     notify: Pin<Box<notify::Notify>>,
     /// The number of operations (`add`, `modify` or `delete`) that are currently waiting on the
     /// mutex to become free. When this is nonzero, `wait` must be suspended until it reaches zero
@@ -38,16 +35,15 @@ pub struct Poller {
 /// The file descriptors to poll in a `Poller`.
 #[derive(Debug)]
 struct Wps {
-    /// The list of `pollfds` taken by poll.
+    /// The list of ThreadSync operations to call the kernel with.
     ///
-    /// The first file descriptor is always present and is used to notify the poller. It is also
-    /// stored in `notify_read`.
+    /// The first one is always present and is used to notify the poller.
     polls: Vec<ThreadSync>,
-    /// The map of each file descriptor to data associated with it. This does not include the file
-    /// descriptors `notify_read` or `notify_write`.
+    /// The map of each waitable object to data associated with it.
     wp_data: HashMap<HashKey, WpData>,
+    /// Keys for the hash map, in order in polls.
     polls_keys: Vec<HashKey>,
-
+    /// A buffer for cleanup, stored here to avoid allocating memory for it every time.
     cleanup_buffer: Vec<HashKey>,
 }
 
@@ -63,9 +59,11 @@ impl HashKey {
 
 impl Wps {
     fn push_item(&mut self, source: &BorrowedTwizzlerWaitable<'static>, mut data: WpData) {
+        // Push onto the polls list, and update meta data.
         let index = self.polls.len();
         data.poll_wps_index = index;
         data.bw_key = source.key();
+        // Get a new ThreadSync.
         let sleep = if data.write {
             source.waitable.wait_item_write()
         } else {
@@ -74,6 +72,7 @@ impl Wps {
         self.polls.push(ThreadSync::new_sleep(sleep));
         self.polls_keys.push(data.hash_key());
         self.wp_data.insert(data.hash_key(), data);
+        // Reserve space for cleanup, if necessary.
         if self.cleanup_buffer.capacity() < self.polls.len() {
             self.cleanup_buffer
                 .reserve(self.polls.len() - self.cleanup_buffer.capacity());
@@ -107,7 +106,9 @@ struct WpData {
     key: usize,
     /// Whether to remove this waitpoint from the poller on the next call to `wait`.
     remove: bool,
+    /// If this is for write or for read.
     write: bool,
+    /// The unique key for the borrow waitable, for making a HashKey.
     bw_key: usize,
 }
 
@@ -158,7 +159,7 @@ impl Poller {
         false
     }
 
-    /// Adds a new file descriptor.
+    /// Adds a new waitable object.
     pub fn add(
         &self,
         wp: &BorrowedTwizzlerWaitable<'static>,
@@ -177,6 +178,7 @@ impl Poller {
         }
 
         self.modify_wps(|wps| {
+            // Don't add twice.
             if ev.writable && wps.wp_data.contains_key(&HashKey::new(wp.key(), true))
                 || ev.readable && wps.wp_data.contains_key(&HashKey::new(wp.key(), false))
             {
@@ -213,7 +215,7 @@ impl Poller {
         })
     }
 
-    /// Modifies an existing file descriptor.
+    /// Modifies an existing waitable object.
     pub fn modify(
         &self,
         source: &BorrowedTwizzlerWaitable<'static>,
@@ -229,7 +231,7 @@ impl Poller {
         let _enter = span.enter();
 
         self.modify_wps(|wps| {
-            //tracing::trace!("wps: {:?}", wps);
+            // If we're interested, make sure we've got it registered. Otherwise, remove anything present.
             if ev.readable {
                 if let Some(data) = wps.wp_data.get_mut(&HashKey::new(source.key(), false)) {
                     data.key = ev.key;
@@ -280,7 +282,7 @@ impl Poller {
         })
     }
 
-    /// Deletes a file descriptor.
+    /// Deletes a waitable object.
     pub fn delete(&self, source: &BorrowedTwizzlerWaitable<'static>) -> io::Result<()> {
         let span = tracing::trace_span!(
             "delete",
@@ -325,7 +327,6 @@ impl Poller {
                 wps = self.operations_complete.wait(wps).unwrap();
             }
 
-            //tracing::trace!("wait wps: {:?}", wps);
             // Perform the poll.
             let timeout =
                 deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
@@ -399,7 +400,7 @@ impl Poller {
         Ok(())
     }
 
-    /// Perform a modification on `fds`, interrupting the current caller of `wait` if it's running.
+    /// Perform a modification on `wps`, interrupting the current caller of `wait` if it's running.
     fn modify_wps(&self, f: impl FnOnce(&mut Wps) -> io::Result<()>) -> io::Result<()> {
         self.waiting_operations.fetch_add(1, Ordering::SeqCst);
 
@@ -408,7 +409,7 @@ impl Poller {
 
         let mut fds = self.wps.lock().unwrap();
 
-        // If there was no caller of `wait` our notification was not removed from the pipe.
+        // If there was no caller of `wait` our notification was not removed.
         if sent_notification {
             let _ = self.notify.pop_notification();
         }
@@ -525,10 +526,11 @@ mod notify {
 
     /// A notification pipe.
     ///
-    /// This implementation uses ther `eventfd` syscall to send notifications.
+    /// This implementation uses thread sync.
     #[derive(Debug)]
     pub(super) struct Notify {
         pub(super) event: AtomicU64,
+        // We can't move, since we build the threadsync once.
         _pin: PhantomPinned,
     }
 
@@ -553,7 +555,7 @@ mod notify {
     }
 
     impl Notify {
-        /// Creates a new notification pipe.
+        /// Creates a new notification object.
         pub(super) fn new() -> io::Result<Self> {
             Ok(Self {
                 event: AtomicU64::new(0),
@@ -561,7 +563,7 @@ mod notify {
             })
         }
 
-        /// Notifies the `Poller` instance via the eventfd file descriptor.
+        /// Notifies the `Poller` instance.
         pub(super) fn notify(&self) -> Result<(), io::Error> {
             if self.event.load(Ordering::SeqCst) == u64::MAX {
                 tracing::warn!("notify event count overflow");
@@ -579,7 +581,7 @@ mod notify {
             Ok(())
         }
 
-        /// Pops a notification (if any) from the eventfd file descriptor.
+        /// Pops a notification (if any).
         pub(super) fn pop_notification(&self) -> Result<(), io::Error> {
             if self.event.load(Ordering::SeqCst) == 0 {
                 return Err(io::Error::from(io::ErrorKind::WouldBlock));
@@ -589,13 +591,91 @@ mod notify {
             Ok(())
         }
 
-        /// Pops all notifications from the eventfd file descriptor.
-        /// Since the eventfd object accumulates all writes in a single 64 bit value,
-        /// this operation is - in fact - equivalent to `pop_notification`.
+        /// Pops all notifications. Equivalent to pop_notification.
         pub(super) fn pop_all_notifications(&self) -> Result<(), io::Error> {
             let _ = self.pop_notification();
 
             Ok(())
         }
+    }
+}
+
+/// A Twizzler waitable object, with lifetime 'a.
+///
+/// Used to refresh wait commands for TwizzlerWaitable objects that
+/// the poller is waiting on.
+pub struct BorrowedTwizzlerWaitable<'a> {
+    pub(crate) waitable: &'a (dyn TwizzlerWaitable + Sync),
+    key: usize,
+}
+
+struct UniqueIds {
+    counter: usize,
+    reuse: Vec<usize>,
+}
+
+impl UniqueIds {
+    fn next(&mut self) -> usize {
+        match self.reuse.pop() {
+            Some(v) => v,
+            None => {
+                self.counter += 1;
+                self.counter
+            }
+        }
+    }
+
+    fn release(&mut self, v: usize) {
+        if v == 0 {
+            return;
+        }
+        if self.counter == v {
+            self.counter -= 1;
+        } else {
+            self.reuse.push(v);
+        }
+    }
+}
+
+static UNIQUE_IDS: Mutex<UniqueIds> = std::sync::Mutex::new(UniqueIds {
+    counter: 1,
+    reuse: Vec::new(),
+});
+
+impl<'a> BorrowedTwizzlerWaitable<'a> {
+    /// Build a new BorrowedTwizzlerWaitable.
+    pub fn new(waitable: &'a (dyn TwizzlerWaitable + Sync)) -> Self {
+        Self {
+            waitable,
+            key: UNIQUE_IDS.lock().unwrap().next(),
+        }
+    }
+
+    pub(crate) fn key(&self) -> usize {
+        self.key
+    }
+}
+
+impl<'a> Drop for BorrowedTwizzlerWaitable<'a> {
+    fn drop(&mut self) {
+        UNIQUE_IDS.lock().unwrap().release(self.key());
+    }
+}
+
+impl<'a> core::fmt::Debug for BorrowedTwizzlerWaitable<'a> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BorrowedTwizzlerWaitable")
+            .field("key", &self.key)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> TwizzlerWaitable for BorrowedTwizzlerWaitable<'a> {
+    fn wait_item_read(&self) -> twizzler_abi::syscall::ThreadSyncSleep {
+        self.waitable.wait_item_read()
+    }
+
+    fn wait_item_write(&self) -> twizzler_abi::syscall::ThreadSyncSleep {
+        self.waitable.wait_item_write()
     }
 }

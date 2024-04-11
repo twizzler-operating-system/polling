@@ -115,90 +115,14 @@ cfg_if! {
         mod iocp;
         use iocp as sys;
     } else if #[cfg(target_os = "twizzler")] {
+        mod twizzler;
+        use twizzler as sys;
     } else {
         compile_error!("polling does not support this target OS");
     }
 }
 
-pub struct BorrowedTwizzlerWaitable<'a> {
-    pub(crate) waitable: &'a (dyn TwizzlerWaitable + Sync),
-    key: usize,
-}
-
-struct UniqueIds {
-    counter: usize,
-    reuse: Vec<usize>,
-}
-
-impl UniqueIds {
-    fn next(&mut self) -> usize {
-        match self.reuse.pop() {
-            Some(v) => v,
-            None => {
-                self.counter += 1;
-                self.counter
-            }
-        }
-    }
-
-    fn release(&mut self, v: usize) {
-        if v == 0 {
-            return;
-        }
-        if self.counter == v {
-            self.counter -= 1;
-        } else {
-            self.reuse.push(v);
-        }
-    }
-}
-
-static UNIQUE_IDS: Mutex<UniqueIds> = std::sync::Mutex::new(UniqueIds {
-    counter: 1,
-    reuse: Vec::new(),
-});
-
-impl<'a> BorrowedTwizzlerWaitable<'a> {
-    pub fn new(waitable: &'a (dyn TwizzlerWaitable + Sync)) -> Self {
-        Self {
-            waitable,
-            key: UNIQUE_IDS.lock().unwrap().next(),
-        }
-    }
-
-    pub fn key(&self) -> usize {
-        self.key
-    }
-}
-
-impl<'a> Drop for BorrowedTwizzlerWaitable<'a> {
-    fn drop(&mut self) {
-        UNIQUE_IDS.lock().unwrap().release(self.key());
-    }
-}
-
-impl<'a> core::fmt::Debug for BorrowedTwizzlerWaitable<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BorrowedTwizzlerWaitable")
-            .field("key", &self.key)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<'a> TwizzlerWaitable for BorrowedTwizzlerWaitable<'a> {
-    fn wait_item_read(&self) -> twizzler_abi::syscall::ThreadSyncSleep {
-        self.waitable.wait_item_read()
-    }
-
-    fn wait_item_write(&self) -> twizzler_abi::syscall::ThreadSyncSleep {
-        self.waitable.wait_item_write()
-    }
-}
-
 pub mod os;
-mod twizzler;
-use twizzler as sys;
-use twizzler_futures::TwizzlerWaitable;
 
 /// Key associated with notifications.
 const NOTIFY_KEY: usize = usize::MAX;
@@ -1146,6 +1070,7 @@ cfg_if! {
         impl<T: AsFd> AsSource for T {}
 
     } else if #[cfg(target_os = "twizzler")] {
+        pub use sys::BorrowedTwizzlerWaitable;
         /// A resource with a raw file descriptor.
         pub trait AsRawSource {
             /// Returns the raw file descriptor.
