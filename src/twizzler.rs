@@ -1,11 +1,15 @@
 //! Bindings to Twizzler.
 
-use std::collections::HashMap;
-use std::io::{self};
-use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    io::{self},
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Condvar, Mutex,
+    },
+    time::{Duration, Instant},
+};
 
 use twizzler_abi::syscall::ThreadSync;
 use twizzler_futures::TwizzlerWaitable;
@@ -231,7 +235,8 @@ impl Poller {
         let _enter = span.enter();
 
         self.modify_wps(|wps| {
-            // If we're interested, make sure we've got it registered. Otherwise, remove anything present.
+            // If we're interested, make sure we've got it registered. Otherwise, remove anything
+            // present.
             if ev.readable {
                 if let Some(data) = wps.wp_data.get_mut(&HashKey::new(source.key(), false)) {
                     data.key = ev.key;
@@ -314,12 +319,15 @@ impl Poller {
         let mut wps = self.wps.lock().unwrap();
 
         loop {
+            let mut dont_wait = false;
             // Complete all current operations.
             loop {
                 if self.notified.swap(false, Ordering::SeqCst) {
                     // `notify` will have sent a notification in case we were polling. We weren't,
                     // so remove it.
-                    return self.notify.pop_notification();
+                    self.notify.pop_notification();
+                    dont_wait = true;
+                    break;
                 } else if self.waiting_operations.load(Ordering::SeqCst) == 0 {
                     break;
                 }
@@ -328,18 +336,18 @@ impl Poller {
             }
 
             // Perform the poll.
-            let timeout =
-                deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
-            let _res = twizzler_abi::syscall::sys_thread_sync(&mut wps.polls, timeout);
+            if !dont_wait {
+                let timeout =
+                    deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+                let _res = twizzler_abi::syscall::sys_thread_sync(&mut wps.polls, timeout);
 
-            let notified = wps.polls[0].ready();
-            tracing::trace!(?notified, "new events",);
-
-            // Read all notifications.
-            if notified {
-                self.notify.pop_all_notifications()?;
+                let notified = wps.polls[0].ready();
+                tracing::debug!(?notified, "new events",);
+                // Read all notifications.
+                if notified {
+                    self.notify.pop_all_notifications()?;
+                }
             }
-
             let wps = &mut *wps;
             // Store the events if there were any.
             for wp_data in wps.wp_data.values() {
@@ -511,18 +519,17 @@ fn cvt_mode_as_remove(mode: PollMode) -> io::Result<bool> {
 }
 
 mod notify {
-    use twizzler_abi::syscall::ThreadSync;
-    use twizzler_abi::syscall::ThreadSyncFlags;
-    use twizzler_abi::syscall::ThreadSyncOp;
-    use twizzler_abi::syscall::ThreadSyncReference;
-    use twizzler_abi::syscall::ThreadSyncSleep;
-    use twizzler_abi::syscall::ThreadSyncWake;
-    use twizzler_futures::TwizzlerWaitable;
+    use std::{
+        io,
+        marker::PhantomPinned,
+        sync::atomic::{AtomicU64, Ordering},
+    };
 
-    use std::io;
-    use std::marker::PhantomPinned;
-    use std::sync::atomic::AtomicU64;
-    use std::sync::atomic::Ordering;
+    use twizzler_abi::syscall::{
+        ThreadSync, ThreadSyncFlags, ThreadSyncOp, ThreadSyncReference, ThreadSyncSleep,
+        ThreadSyncWake,
+    };
+    use twizzler_futures::TwizzlerWaitable;
 
     /// A notification pipe.
     ///

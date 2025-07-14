@@ -24,9 +24,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(polling_test_poll_backend)
 cfg-if = "1"
 tracing = { version = "0.1.37", default-features = false }
 
-#[target.'cfg(target_os = "twizzler")'.dependencies]
-twizzler-abi = { path = "../../twizzler-abi" }
-twizzler-futures = { path = "../../twizzler-futures" }
+[target.'cfg(target_os = "twizzler")'.dependencies]
+twizzler-abi = { path = "../../lib/twizzler-abi" }
+twizzler-futures = { path = "../../lib/twizzler-futures" }
 bitflags = "2.4.1"
 
 [target.'cfg(any(unix, target_os = "fuchsia", target_os = "vxworks"))'.dependencies.rustix]
