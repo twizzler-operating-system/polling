@@ -62,7 +62,7 @@ impl HashKey {
 }
 
 impl Wps {
-    fn push_item(&mut self, source: &BorrowedTwizzlerWaitable<'static>, mut data: WpData) {
+    fn push_item(&mut self, source: &BorrowedTwizzlerWaitable, mut data: WpData) {
         // Push onto the polls list, and update meta data.
         let index = self.polls.len();
         data.poll_wps_index = index;
@@ -83,7 +83,7 @@ impl Wps {
         }
     }
 
-    fn remove_item_dir(&mut self, source: &BorrowedTwizzlerWaitable<'static>, write: bool) {
+    fn remove_item_dir(&mut self, source: &BorrowedTwizzlerWaitable, write: bool) {
         self.remove_item_key(&HashKey::new(source.key(), write));
     }
 
@@ -164,12 +164,7 @@ impl Poller {
     }
 
     /// Adds a new waitable object.
-    pub fn add(
-        &self,
-        wp: &BorrowedTwizzlerWaitable<'static>,
-        ev: Event,
-        mode: PollMode,
-    ) -> io::Result<()> {
+    pub fn add(&self, wp: &BorrowedTwizzlerWaitable, ev: Event, mode: PollMode) -> io::Result<()> {
         let span = tracing::trace_span!(
             "add",
             notify_read = ?self.notify,
@@ -222,7 +217,7 @@ impl Poller {
     /// Modifies an existing waitable object.
     pub fn modify(
         &self,
-        source: &BorrowedTwizzlerWaitable<'static>,
+        source: &BorrowedTwizzlerWaitable,
         ev: Event,
         mode: PollMode,
     ) -> io::Result<()> {
@@ -288,7 +283,7 @@ impl Poller {
     }
 
     /// Deletes a waitable object.
-    pub fn delete(&self, source: &BorrowedTwizzlerWaitable<'static>) -> io::Result<()> {
+    pub fn delete(&self, source: &BorrowedTwizzlerWaitable) -> io::Result<()> {
         let span = tracing::trace_span!(
             "delete",
             notify_read = ?self.notify,
@@ -325,7 +320,7 @@ impl Poller {
                 if self.notified.swap(false, Ordering::SeqCst) {
                     // `notify` will have sent a notification in case we were polling. We weren't,
                     // so remove it.
-                    self.notify.pop_notification();
+                    let _ = self.notify.pop_notification();
                     dont_wait = true;
                     break;
                 } else if self.waiting_operations.load(Ordering::SeqCst) == 0 {
@@ -342,7 +337,7 @@ impl Poller {
                 let _res = twizzler_abi::syscall::sys_thread_sync(&mut wps.polls, timeout);
 
                 let notified = wps.polls[0].ready();
-                tracing::debug!(?notified, "new events",);
+                tracing::trace!(?notified, "new events",);
                 // Read all notifications.
                 if notified {
                     self.notify.pop_all_notifications()?;
@@ -611,8 +606,8 @@ mod notify {
 ///
 /// Used to refresh wait commands for TwizzlerWaitable objects that
 /// the poller is waiting on.
-pub struct BorrowedTwizzlerWaitable<'a> {
-    pub(crate) waitable: &'a (dyn TwizzlerWaitable + Sync),
+pub struct BorrowedTwizzlerWaitable {
+    pub(crate) waitable: Box<dyn TwizzlerWaitable + Sync + Send>,
     key: usize,
 }
 
@@ -649,11 +644,19 @@ static UNIQUE_IDS: Mutex<UniqueIds> = std::sync::Mutex::new(UniqueIds {
     reuse: Vec::new(),
 });
 
-impl<'a> BorrowedTwizzlerWaitable<'a> {
+impl BorrowedTwizzlerWaitable {
     /// Build a new BorrowedTwizzlerWaitable.
-    pub fn new(waitable: &'a (dyn TwizzlerWaitable + Sync)) -> Self {
+    pub fn new<T: TwizzlerWaitable + Sync + Send + 'static>(waitable: Pin<&'static T>) -> Self {
         Self {
-            waitable,
+            waitable: Box::new(Pb { waitable }),
+            key: UNIQUE_IDS.lock().unwrap().next(),
+        }
+    }
+
+    /// Build a new BorrowedTwizzlerWaitable.
+    pub fn new_fd<T: std::os::fd::AsRawFd + Sync + Send + 'static>(fd: T) -> Self {
+        Self {
+            waitable: Box::new(Fd { fd: fd.as_raw_fd() }),
             key: UNIQUE_IDS.lock().unwrap().next(),
         }
     }
@@ -663,13 +666,27 @@ impl<'a> BorrowedTwizzlerWaitable<'a> {
     }
 }
 
-impl<'a> Drop for BorrowedTwizzlerWaitable<'a> {
+struct Fd {
+    fd: i32,
+}
+
+impl TwizzlerWaitable for Fd {
+    fn wait_item_read(&self) -> twizzler_abi::syscall::ThreadSyncSleep {
+        self.fd.wait_item_read()
+    }
+
+    fn wait_item_write(&self) -> twizzler_abi::syscall::ThreadSyncSleep {
+        self.fd.wait_item_write()
+    }
+}
+
+impl Drop for BorrowedTwizzlerWaitable {
     fn drop(&mut self) {
         UNIQUE_IDS.lock().unwrap().release(self.key());
     }
 }
 
-impl<'a> core::fmt::Debug for BorrowedTwizzlerWaitable<'a> {
+impl core::fmt::Debug for BorrowedTwizzlerWaitable {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("BorrowedTwizzlerWaitable")
             .field("key", &self.key)
@@ -677,7 +694,21 @@ impl<'a> core::fmt::Debug for BorrowedTwizzlerWaitable<'a> {
     }
 }
 
-impl<'a> TwizzlerWaitable for BorrowedTwizzlerWaitable<'a> {
+impl TwizzlerWaitable for BorrowedTwizzlerWaitable {
+    fn wait_item_read(&self) -> twizzler_abi::syscall::ThreadSyncSleep {
+        self.waitable.wait_item_read()
+    }
+
+    fn wait_item_write(&self) -> twizzler_abi::syscall::ThreadSyncSleep {
+        self.waitable.wait_item_write()
+    }
+}
+
+struct Pb {
+    waitable: Pin<&'static (dyn TwizzlerWaitable + Send + Sync)>,
+}
+
+impl TwizzlerWaitable for Pb {
     fn wait_item_read(&self) -> twizzler_abi::syscall::ThreadSyncSleep {
         self.waitable.wait_item_read()
     }

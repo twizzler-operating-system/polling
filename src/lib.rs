@@ -2,11 +2,13 @@
 //!
 //! Supported platforms:
 //! - [epoll](https://en.wikipedia.org/wiki/Epoll): Linux, Android, RedoxOS
-//! - [kqueue](https://en.wikipedia.org/wiki/Kqueue): macOS, iOS, tvOS, watchOS, visionOS, FreeBSD, NetBSD, OpenBSD,
-//!   DragonFly BSD
+//! - [kqueue](https://en.wikipedia.org/wiki/Kqueue): macOS, iOS, tvOS, watchOS, visionOS, FreeBSD,
+//!   NetBSD, OpenBSD, DragonFly BSD
 //! - [event ports](https://illumos.org/man/port_create): illumos, Solaris
-//! - [poll](https://en.wikipedia.org/wiki/Poll_(Unix)): VxWorks, Fuchsia, HermitOS, other Unix systems
-//! - [IOCP](https://learn.microsoft.com/en-us/windows/win32/fileio/i-o-completion-ports): Windows, Wine (version 7.13+)
+//! - [poll](https://en.wikipedia.org/wiki/Poll_(Unix)): VxWorks, Fuchsia, HermitOS, other Unix
+//!   systems
+//! - [IOCP](https://learn.microsoft.com/en-us/windows/win32/fileio/i-o-completion-ports): Windows,
+//!   Wine (version 7.13+)
 //!
 //! By default, polling is done in oneshot mode, which means interest in I/O events needs to
 //! be re-enabled after an event is delivered if we're interested in the next event of the same
@@ -18,8 +20,9 @@
 //! # Examples
 //!
 //! ```no_run
-//! use polling::{Event, Events, Poller};
 //! use std::net::TcpListener;
+//!
+//! use polling::{Event, Events, Poller};
 //!
 //! // Create a TCP listener.
 //! let socket = TcpListener::bind("127.0.0.1:8000")?;
@@ -63,14 +66,17 @@
     html_logo_url = "https://raw.githubusercontent.com/smol-rs/smol/master/assets/images/logo_fullsize_transparent.png"
 )]
 
-use std::cell::Cell;
-use std::fmt;
-use std::io;
-use std::marker::PhantomData;
-use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::{
+    cell::Cell,
+    fmt, io,
+    marker::PhantomData,
+    num::NonZeroUsize,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
+    time::{Duration, Instant},
+};
 
 use cfg_if::cfg_if;
 
@@ -339,13 +345,14 @@ impl Event {
 
     /// Tells if this event is the result of a connection failure.
     ///
-    /// This function checks if a TCP connection has failed. It corresponds to the `EPOLLERR`  or `EPOLLHUP` event in Linux
-    /// and `CONNECT_FAILED` event in Windows IOCP.
+    /// This function checks if a TCP connection has failed. It corresponds to the `EPOLLERR`  or
+    /// `EPOLLHUP` event in Linux and `CONNECT_FAILED` event in Windows IOCP.
     ///
     /// # Examples
     ///
     /// ```
     /// use std::{io, net};
+    ///
     /// // Assuming polling and socket2 are included as dependencies in Cargo.toml
     /// use polling::Event;
     /// use socket2::Type;
@@ -372,14 +379,11 @@ impl Event {
     ///         None => {
     ///             println!("no event");
     ///             return Ok(());
-    ///         },
+    ///         }
     ///     };
     ///
     ///     println!("event: {:?}", event);
-    ///     if event
-    ///         .is_connect_failed()
-    ///         .unwrap_or_default()
-    ///     {
+    ///     if event.is_connect_failed().unwrap_or_default() {
     ///         println!("connect failed");
     ///     }
     ///
@@ -389,8 +393,8 @@ impl Event {
     ///
     /// # Returns
     ///
-    /// Returns `Some(true)` if the connection has failed, `Some(false)` if the connection has not failed,
-    /// or `None` if the platform does not support detecting this condition.
+    /// Returns `Some(true)` if the connection has failed, `Some(false)` if the connection has not
+    /// failed, or `None` if the platform does not support detecting this condition.
     #[inline]
     #[deprecated(
         since = "3.4.0",
@@ -402,13 +406,15 @@ impl Event {
 
     /// Tells if this event is the result of a connection failure.
     ///
-    /// This function checks if an error exist, particularly useful in detecting if TCP connection failed. It corresponds to the `EPOLLERR` event in Linux
-    /// and `CONNECT_FAILED` event in Windows IOCP.
+    /// This function checks if an error exist, particularly useful in detecting if TCP connection
+    /// failed. It corresponds to the `EPOLLERR` event in Linux and `CONNECT_FAILED` event in
+    /// Windows IOCP.
     ///
     /// ## Caveats
     ///
-    /// In `epoll`, a TCP connection failure is indicated by `EPOLLERR` + `EPOLLHUP`, though just `EPOLLERR` is enough to indicate a connection failure.
-    /// EPOLLHUP may happen when we haven't event called `connect` on the socket, but it is still a valid event to check for.
+    /// In `epoll`, a TCP connection failure is indicated by `EPOLLERR` + `EPOLLHUP`, though just
+    /// `EPOLLERR` is enough to indicate a connection failure. EPOLLHUP may happen when we
+    /// haven't event called `connect` on the socket, but it is still a valid event to check for.
     ///
     /// Returns `Some(true)` if the connection has failed, `Some(false)` if there is no error,
     /// or `None` if the platform does not support detecting this condition.
@@ -676,15 +682,18 @@ impl Poller {
     /// # Examples
     ///
     /// ```
-    /// use polling::{Event, Poller};
     /// use std::net::TcpListener;
+    ///
+    /// use polling::{Event, Poller};
     ///
     /// let socket = TcpListener::bind("127.0.0.1:0")?;
     /// socket.set_nonblocking(true)?;
     /// let key = 7;
     ///
     /// let poller = Poller::new()?;
-    /// unsafe { poller.add(&socket, Event::all(key))?; }
+    /// unsafe {
+    ///     poller.add(&socket, Event::all(key))?;
+    /// }
     /// poller.delete(&socket)?;
     /// # std::io::Result::Ok(())
     /// ```
@@ -713,9 +722,9 @@ impl Poller {
     /// # Examples
     ///
     /// ```
+    /// use std::{net::TcpListener, time::Duration};
+    ///
     /// use polling::{Event, Events, Poller};
-    /// use std::net::TcpListener;
-    /// use std::time::Duration;
     ///
     /// let socket = TcpListener::bind("127.0.0.1:0")?;
     /// socket.set_nonblocking(true)?;
@@ -848,8 +857,9 @@ impl Events {
     /// # Examples
     ///
     /// ```
-    /// use polling::Events;
     /// use std::num::NonZeroUsize;
+    ///
+    /// use polling::Events;
     ///
     /// let capacity = NonZeroUsize::new(1024).unwrap();
     /// let events = Events::with_capacity(capacity);
@@ -869,8 +879,9 @@ impl Events {
     /// # Examples
     ///
     /// ```
-    /// use polling::{Event, Events, Poller};
     /// use std::time::Duration;
+    ///
+    /// use polling::{Event, Events, Poller};
     ///
     /// # fn main() -> std::io::Result<()> {
     /// let poller = Poller::new()?;
@@ -943,8 +954,9 @@ impl Events {
     /// # Examples
     ///
     /// ```
-    /// use polling::Events;
     /// use std::num::NonZeroUsize;
+    ///
+    /// use polling::Events;
     ///
     /// let cap = NonZeroUsize::new(10).unwrap();
     /// let events = Events::with_capacity(std::num::NonZeroUsize::new(10).unwrap());
@@ -993,8 +1005,9 @@ impl fmt::Debug for Events {
     )))
 )]
 mod raw_fd_impl {
-    use crate::Poller;
     use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, RawFd};
+
+    use crate::Poller;
 
     impl AsRawFd for Poller {
         fn as_raw_fd(&self) -> RawFd {
@@ -1012,8 +1025,9 @@ mod raw_fd_impl {
 #[cfg(windows)]
 #[cfg_attr(docsrs, doc(cfg(windows)))]
 mod raw_handle_impl {
-    use crate::Poller;
     use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, RawHandle};
+
+    use crate::Poller;
 
     impl AsRawHandle for Poller {
         fn as_raw_handle(&self) -> RawHandle {
@@ -1074,13 +1088,13 @@ cfg_if! {
         /// A resource with a raw file descriptor.
         pub trait AsRawSource {
             /// Returns the raw file descriptor.
-            fn raw(&self) -> &BorrowedTwizzlerWaitable<'static>;
+            fn raw(&self) -> &BorrowedTwizzlerWaitable;
         }
 
         /// A resource with a borrowed file descriptor.
         pub trait AsSource {
             /// Returns the borrowed file descriptor.
-            fn source(&self) -> &BorrowedTwizzlerWaitable<'static>;
+            fn source(&self) -> &BorrowedTwizzlerWaitable;
         }
     } else if #[cfg(windows)] {
         use std::os::windows::io::{AsRawSocket, RawSocket, AsSocket, BorrowedSocket};
