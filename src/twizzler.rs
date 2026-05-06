@@ -69,9 +69,13 @@ impl Wps {
         data.bw_key = source.key();
         // Get a new ThreadSync.
         let sleep = if data.write {
-            source.waitable.wait_item_write()
+            let (sleep, ready) = source.waitable.wait_item_write();
+            data.ready = ready;
+            sleep
         } else {
-            source.waitable.wait_item_read()
+            let (sleep, ready) = source.waitable.wait_item_read();
+            data.ready = ready;
+            sleep
         };
         self.polls.push(ThreadSync::new_sleep(sleep));
         self.polls_keys.push(data.hash_key());
@@ -112,6 +116,8 @@ struct WpData {
     remove: bool,
     /// If this is for write or for read.
     write: bool,
+    /// Was ready at reg time.
+    ready: bool,
     /// The unique key for the borrow waitable, for making a HashKey.
     bw_key: usize,
 }
@@ -138,7 +144,7 @@ impl Poller {
 
         tracing::trace!(?notify, "new");
 
-        let sleep = ThreadSync::new_sleep(notify.wait_item_read());
+        let sleep = ThreadSync::new_sleep(notify.wait_item_read().0);
         Ok(Self {
             wps: Mutex::new(Wps {
                 polls: vec![sleep],
@@ -193,6 +199,7 @@ impl Poller {
                         // These get set in push.
                         poll_wps_index: 0,
                         bw_key: 0,
+                        ready: false,
                     },
                 );
             }
@@ -206,6 +213,7 @@ impl Poller {
                         // These get set in push.
                         poll_wps_index: 0,
                         bw_key: 0,
+                        ready: false,
                     },
                 );
             }
@@ -236,8 +244,9 @@ impl Poller {
                 if let Some(data) = wps.wp_data.get_mut(&HashKey::new(source.key(), false)) {
                     data.key = ev.key;
                     data.remove = cvt_mode_as_remove(mode)?;
-                    wps.polls[data.poll_wps_index] =
-                        ThreadSync::new_sleep(source.waitable.wait_item_read());
+                    let (sleep, ready) = source.waitable.wait_item_read();
+                    wps.polls[data.poll_wps_index] = ThreadSync::new_sleep(sleep);
+                    data.ready = ready;
                 } else {
                     wps.push_item(
                         source,
@@ -248,6 +257,7 @@ impl Poller {
                             // These get set in push.
                             poll_wps_index: 0,
                             bw_key: 0,
+                            ready: false,
                         },
                     );
                 }
@@ -259,8 +269,9 @@ impl Poller {
                 if let Some(data) = wps.wp_data.get_mut(&HashKey::new(source.key(), true)) {
                     data.key = ev.key;
                     data.remove = cvt_mode_as_remove(mode)?;
-                    wps.polls[data.poll_wps_index] =
-                        ThreadSync::new_sleep(source.waitable.wait_item_write());
+                    let (sleep, ready) = source.waitable.wait_item_write();
+                    wps.polls[data.poll_wps_index] = ThreadSync::new_sleep(sleep);
+                    data.ready = ready;
                 } else {
                     wps.push_item(
                         source,
@@ -271,6 +282,7 @@ impl Poller {
                             // These get set in push.
                             poll_wps_index: 0,
                             bw_key: 0,
+                            ready: false,
                         },
                     );
                 }
@@ -328,6 +340,14 @@ impl Poller {
                 }
 
                 wps = self.operations_complete.wait(wps).unwrap();
+            }
+
+            for wp_data in wps.wp_data.values_mut() {
+                if wp_data.ready {
+                    wp_data.ready = false;
+                    dont_wait = true;
+                    break;
+                }
             }
 
             // Perform the poll.
@@ -537,21 +557,27 @@ mod notify {
     }
 
     impl TwizzlerWaitable for Notify {
-        fn wait_item_read(&self) -> twizzler_abi::syscall::ThreadSyncSleep {
-            ThreadSyncSleep::new(
-                ThreadSyncReference::Virtual(&self.event),
-                0,
-                ThreadSyncOp::Equal,
-                ThreadSyncFlags::empty(),
+        fn wait_item_read(&self) -> (twizzler_abi::syscall::ThreadSyncSleep, bool) {
+            (
+                ThreadSyncSleep::new(
+                    ThreadSyncReference::Virtual(&self.event),
+                    0,
+                    ThreadSyncOp::Equal,
+                    ThreadSyncFlags::empty(),
+                ),
+                self.event.load(Ordering::SeqCst) != 0,
             )
         }
 
-        fn wait_item_write(&self) -> twizzler_abi::syscall::ThreadSyncSleep {
-            ThreadSyncSleep::new(
-                ThreadSyncReference::Virtual(&self.event),
-                u64::MAX,
-                ThreadSyncOp::Equal,
-                ThreadSyncFlags::empty(),
+        fn wait_item_write(&self) -> (twizzler_abi::syscall::ThreadSyncSleep, bool) {
+            (
+                ThreadSyncSleep::new(
+                    ThreadSyncReference::Virtual(&self.event),
+                    u64::MAX,
+                    ThreadSyncOp::Equal,
+                    ThreadSyncFlags::empty(),
+                ),
+                self.event.load(Ordering::SeqCst) != 0,
             )
         }
     }
@@ -671,11 +697,11 @@ struct Fd {
 }
 
 impl TwizzlerWaitable for Fd {
-    fn wait_item_read(&self) -> twizzler_abi::syscall::ThreadSyncSleep {
+    fn wait_item_read(&self) -> (twizzler_abi::syscall::ThreadSyncSleep, bool) {
         self.fd.wait_item_read()
     }
 
-    fn wait_item_write(&self) -> twizzler_abi::syscall::ThreadSyncSleep {
+    fn wait_item_write(&self) -> (twizzler_abi::syscall::ThreadSyncSleep, bool) {
         self.fd.wait_item_write()
     }
 }
@@ -695,11 +721,11 @@ impl core::fmt::Debug for BorrowedTwizzlerWaitable {
 }
 
 impl TwizzlerWaitable for BorrowedTwizzlerWaitable {
-    fn wait_item_read(&self) -> twizzler_abi::syscall::ThreadSyncSleep {
+    fn wait_item_read(&self) -> (twizzler_abi::syscall::ThreadSyncSleep, bool) {
         self.waitable.wait_item_read()
     }
 
-    fn wait_item_write(&self) -> twizzler_abi::syscall::ThreadSyncSleep {
+    fn wait_item_write(&self) -> (twizzler_abi::syscall::ThreadSyncSleep, bool) {
         self.waitable.wait_item_write()
     }
 }
@@ -709,11 +735,11 @@ struct Pb {
 }
 
 impl TwizzlerWaitable for Pb {
-    fn wait_item_read(&self) -> twizzler_abi::syscall::ThreadSyncSleep {
+    fn wait_item_read(&self) -> (twizzler_abi::syscall::ThreadSyncSleep, bool) {
         self.waitable.wait_item_read()
     }
 
-    fn wait_item_write(&self) -> twizzler_abi::syscall::ThreadSyncSleep {
+    fn wait_item_write(&self) -> (twizzler_abi::syscall::ThreadSyncSleep, bool) {
         self.waitable.wait_item_write()
     }
 }
