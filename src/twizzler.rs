@@ -342,12 +342,13 @@ impl Poller {
                 wps = self.operations_complete.wait(wps).unwrap();
             }
 
-            for wp_data in wps.wp_data.values_mut() {
-                if wp_data.ready {
-                    wp_data.ready = false;
-                    dont_wait = true;
-                    break;
-                }
+            // A source that reported live readiness when it was registered must not block:
+            // its wait word can legitimately still read "not ready", since the word and the
+            // real state are only reconciled by the owning subsystem (e.g. the socket
+            // engine's background poll pass). The flag is consumed -- and turned into an
+            // event -- by the reporting loop below; don't clear it here.
+            if wps.wp_data.values().any(|wp_data| wp_data.ready) {
+                dont_wait = true;
             }
 
             // Perform the poll.
@@ -362,12 +363,27 @@ impl Poller {
                 if notified {
                     self.notify.pop_all_notifications()?;
                 }
+
+                // If an internal notification (a concurrent add/modify/delete) was the only
+                // thing that woke us, re-poll for the rest of the timeout rather than
+                // returning zero events. A user-visible notify() must still return promptly,
+                // and consuming `self.notified` here is what keeps it from also making the
+                // *next* wait() return without blocking.
+                let any_ready = wps
+                    .wp_data
+                    .values()
+                    .any(|wp_data| wp_data.ready || wps.polls[wp_data.poll_wps_index].ready());
+                if notified && !any_ready && !self.notified.swap(false, Ordering::SeqCst) {
+                    continue;
+                }
             }
             let wps = &mut *wps;
             // Store the events if there were any.
-            for wp_data in wps.wp_data.values() {
+            for wp_data in wps.wp_data.values_mut() {
                 let poll_wp = &mut wps.polls[wp_data.poll_wps_index];
-                if poll_wp.ready() {
+                // `ready` is the live-readiness the source reported at registration time; it
+                // is authoritative even when the wait word has not caught up yet.
+                if poll_wp.ready() || std::mem::replace(&mut wp_data.ready, false) {
                     // Store event
                     events.inner.push(Event {
                         key: wp_data.key,
