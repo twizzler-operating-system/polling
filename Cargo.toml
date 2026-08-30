@@ -29,7 +29,9 @@ twizzler-abi = "*"
 twizzler-futures = "*"
 bitflags = "2.4.1"
 
-[target.'cfg(any(unix, target_os = "fuchsia", target_os = "vxworks"))'.dependencies.rustix]
+# Not twizzler: rustix has no arm for an unknown unix (its `ioctl::_Opcode` and the whole
+# `process` backend are per-OS), and this target uses polling's own twizzler backend anyway.
+[target.'cfg(all(any(unix, target_os = "fuchsia", target_os = "vxworks"), not(target_os = "twizzler")))'.dependencies.rustix]
 version = "1.0.5"
 features = ["event", "fs", "pipe", "process", "std", "time"]
 default-features = false

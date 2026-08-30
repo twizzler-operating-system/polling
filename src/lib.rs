@@ -108,13 +108,13 @@ cfg_if! {
     ))] {
         mod kqueue;
         use kqueue as sys;
-    } else if #[cfg(any(
+    } else if #[cfg(all(any(
         target_os = "vxworks",
         target_os = "hermit",
         target_os = "fuchsia",
         target_os = "horizon",
         unix,
-    ))] {
+    ), not(target_os = "twizzler")))] {
         mod poll;
         use poll as sys;
     } else if #[cfg(target_os = "windows")] {
@@ -1049,7 +1049,7 @@ impl fmt::Debug for Poller {
 }
 
 cfg_if! {
-    if #[cfg(any(unix, target_os = "hermit"))] {
+    if #[cfg(all(any(unix, target_os = "hermit"), not(target_os = "twizzler")))] {
         #[cfg(unix)]
         use std::os::unix::io::{AsRawFd, RawFd, AsFd, BorrowedFd};
         #[cfg(target_os = "hermit")]
